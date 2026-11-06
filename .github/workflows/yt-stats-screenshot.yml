@@ -56,6 +56,15 @@ jobs:
 
       - name: Take Stats-for-Nerds screenshot
         id: screenshot
+        # Optional Google sign-in (throwaway account) so YouTube does not
+        # show its signed-out bot gate. The user adds these two repo
+        # secrets himself (repo -> Settings -> Secrets and variables ->
+        # Actions): YT_EMAIL and YT_PASSWORD. When either is missing the
+        # script runs watch-only, exactly as before. GitHub masks secret
+        # values in logs; the script never prints them either.
+        env:
+          YT_EMAIL: ${{ secrets.YT_EMAIL }}
+          YT_PASSWORD: ${{ secrets.YT_PASSWORD }}
         run: |
           if [ -n "${{ inputs.video_url }}" ]; then
             python yt_stats_screenshot.py --video-url "${{ inputs.video_url }}" --output-dir screenshots
