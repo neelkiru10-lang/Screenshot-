@@ -3,6 +3,9 @@
 Take a REAL Stats-for-Nerds screenshot of a YouTube video.
 
 What it does (honest, no faking):
+  0. If YT_EMAIL and YT_PASSWORD are set in the environment (GitHub repo
+     secrets), signs in to Google first, so YouTube does not show its
+     signed-out bot gate. Without them the run stays watch-only.
   1. Opens the video URL (or searches YouTube for a keyword and opens the top result).
   2. Dismisses any consent/cookie dialog.
   3. Plays the video in REAL TIME, start to end, at normal speed (1x).
@@ -32,6 +35,15 @@ Exit codes:
      ("not a robot", "unusual traffic", "verify you are human", "captcha")
   6  video length outside the supported range (under 5s or over 8:00)
      (v1 used 4 for bot-check and 5 for length; v2 renumbers bot-check to 5.)
+  7  Google sign-in challenge / sign-in did not complete
+     ("Verify it's you", "This browser or app may not be secure",
+      phone verification, captcha, wrong email/password)
+
+Environment (optional):
+  YT_EMAIL / YT_PASSWORD — throwaway Google account used only to sign in
+  before opening the video. When both are set, the script signs in; when
+  either is missing, the run stays watch-only. The values are read only
+  from the environment and are never printed or written to any file.
 
 Requires: selenium (pip install selenium). Chrome is provided by
 Selenium Manager (GitHub-hosted runners already have Google Chrome).
@@ -59,6 +71,26 @@ PLAY_TIMEOUT_S = 90       # time allowed for the video element to appear
 BOT_MARKERS = ["not a robot", "unusual traffic", "verify you are human",
                "captcha", "confirm you're human", "confirm you're not a bot",
                "sign in to confirm", "our systems have detected"]
+
+# Text Google shows when sign-in needs extra verification or the
+# credentials are wrong. Any of these ends the run with exit code 7.
+SIGNIN_CHALLENGE_MARKERS = [
+    "verify it's you",
+    "this browser or app may not be secure",
+    "verify your phone",
+    "confirm your phone",
+    "enter your phone number",
+    "2-step verification",
+    "check your phone",
+    "captcha",
+    "recaptcha",
+    "verify your identity",
+]
+
+WRONG_CREDENTIALS_MARKERS = [
+    "couldn't find your google account",
+    "wrong password",
+]
 
 
 def fail(code, message):
@@ -184,6 +216,150 @@ def dismiss_consent(driver, timeout=15):
     return False
 
 
+def find_first_visible(driver, locators):
+    """First displayed element matching any (By, value) locator, or None."""
+    for by, value in locators:
+        try:
+            for el in driver.find_elements(by, value):
+                if el.is_displayed():
+                    return el
+        except Exception:
+            continue
+    return None
+
+
+def click_next(driver):
+    """Click Google's 'Next' button via several selector strategies."""
+    btn = find_first_visible(driver, [
+        (By.ID, "identifierNext"),
+        (By.ID, "passwordNext"),
+        (By.XPATH, "//button[.//span[normalize-space()='Next']]"),
+        (By.XPATH, "//button[contains(., 'Next')]"),
+        (By.XPATH, "//*[@role='button' and contains(., 'Next')]"),
+    ])
+    if btn is None:
+        return False
+    try:
+        btn.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", btn)
+    return True
+
+
+def sign_in_challenge(driver):
+    """Name of the sign-in challenge shown, or None if none is visible."""
+    text = page_text_lower(driver)
+    for marker in SIGNIN_CHALLENGE_MARKERS + WRONG_CREDENTIALS_MARKERS:
+        if marker in text:
+            return marker
+    return None
+
+
+def sign_in(driver, video_id, output_dir):
+    """Sign in to Google using YT_EMAIL / YT_PASSWORD from the environment.
+
+    Runs only when both are set; otherwise the run stays watch-only and
+    this is a no-op (returns False). On a challenge page (extra
+    verification Google asks for) or a sign-in that does not complete,
+    saves a debug screenshot and exits with code 7. The email and
+    password are never printed or written to any file.
+    """
+    email = os.environ.get("YT_EMAIL")
+    password = os.environ.get("YT_PASSWORD")
+    if not email or not password:
+        print("No Google credentials configured — continuing without "
+              "sign-in (watch-only).")
+        return False
+
+    debug_id = video_id or "signin"
+    print("Signing in to Google with the configured account "
+          "(credentials are never logged).")
+    driver.get("https://accounts.google.com/signin/v2/identifier")
+
+    # Step 1: email.
+    email_field = None
+    deadline = time.time() + 20
+    while time.time() < deadline and email_field is None:
+        email_field = find_first_visible(driver, [
+            (By.ID, "identifierId"),
+            (By.NAME, "identifier"),
+            (By.XPATH, "//input[@type='email']"),
+        ])
+        if email_field is None:
+            time.sleep(1)
+    if email_field is None:
+        dump_debug(driver, debug_id, output_dir, redact=[email])
+        fail(7, "Google sign-in: email field did not appear "
+                "(page may have changed).")
+    email_field.click()
+    email_field.send_keys(email)
+    if not click_next(driver):
+        dump_debug(driver, debug_id, output_dir, redact=[email])
+        fail(7, "Google sign-in: could not click Next after the email.")
+    time.sleep(2)
+    challenge = sign_in_challenge(driver)
+    if challenge:
+        dump_debug(driver, debug_id, output_dir, redact=[email])
+        fail(7, f"Google sign-in challenge after email: {challenge}")
+
+    # Step 2: password.
+    password_field = None
+    deadline = time.time() + 20
+    while time.time() < deadline and password_field is None:
+        password_field = find_first_visible(driver, [
+            (By.NAME, "password"),
+            (By.XPATH, "//input[@type='password']"),
+        ])
+        if password_field is None:
+            time.sleep(1)
+    if password_field is None:
+        challenge = sign_in_challenge(driver)
+        dump_debug(driver, debug_id, output_dir, redact=[email])
+        if challenge:
+            fail(7, f"Google sign-in challenge: {challenge}")
+        fail(7, "Google sign-in: password field did not appear.")
+    password_field.click()
+    password_field.send_keys(password)
+    if not click_next(driver):
+        dump_debug(driver, debug_id, output_dir, redact=[email])
+        fail(7, "Google sign-in: could not click Next after the password.")
+
+    # Step 3: wait for the redirect to the signed-in account home.
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        url = driver.current_url.lower()
+        if "myaccount.google.com" in url or "youtube.com" in url:
+            print("Google sign-in succeeded.")
+            return True
+        challenge = sign_in_challenge(driver)
+        if challenge:
+            dump_debug(driver, debug_id, output_dir, redact=[email])
+            fail(7, f"Google sign-in challenge: {challenge}")
+        if "accounts.google.com" not in url:
+            # Landed somewhere unexpected but with no challenge and no
+            # longer on the sign-in pages: treat as signed in.
+            print(f"Google sign-in landed on: {driver.current_url}")
+            return True
+        # Optional "protect your account" prompt: skip it if offered.
+        skip = find_first_visible(driver, [
+            (By.XPATH, "//button[.//span[normalize-space()='Skip']]"),
+            (By.XPATH, "//button[.//span[normalize-space()='Not now']]"),
+        ])
+        if skip is not None:
+            print("Google sign-in: skipping optional account-protection prompt.")
+            try:
+                skip.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", skip)
+        time.sleep(1)
+    challenge = sign_in_challenge(driver)
+    dump_debug(driver, debug_id, output_dir, redact=[email])
+    if challenge:
+        fail(7, f"Google sign-in challenge: {challenge}")
+    fail(7, "Google sign-in did not complete within 30s "
+            "(still on accounts.google.com).")
+
+
 def page_text_lower(driver):
     try:
         return driver.find_element(By.TAG_NAME, "body").text.lower()
@@ -201,9 +377,13 @@ def looks_like_bot_check(driver):
     return False
 
 
-def dump_debug(driver, video_id, output_dir):
+def dump_debug(driver, video_id, output_dir, redact=None):
     """Save a screenshot of whatever page actually loaded, plus title,
-    URL and a page-text snippet, so a failure can be diagnosed."""
+    URL and a page-text snippet, so a failure can be diagnosed.
+
+    Strings in `redact` (e.g. the sign-in email) are replaced with
+    "[redacted]" in everything printed, so credentials never reach logs.
+    """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"debug-{video_id}.png")
     try:
@@ -211,15 +391,23 @@ def dump_debug(driver, video_id, output_dir):
         print(f"Debug screenshot saved: {path}")
     except Exception as exc:  # noqa: BLE001 - best effort
         print(f"Could not save debug screenshot: {exc}")
+
+    def clean(text):
+        if redact:
+            for secret in redact:
+                if secret:
+                    text = text.replace(secret, "[redacted]")
+        return text
+
     try:
-        print(f"Debug page title: {driver.title!r}")
+        print(f"Debug page title: {clean(driver.title)!r}")
     except Exception:
         pass
     try:
         print(f"Debug current URL: {driver.current_url}")
     except Exception:
         pass
-    snippet = page_text_lower(driver).replace("\n", " ")[:500]
+    snippet = clean(page_text_lower(driver).replace("\n", " ")[:500])
     print(f"Debug page text (first 500 chars): {snippet!r}")
     return path
 
@@ -408,6 +596,11 @@ def main():
 
     driver = make_driver(args.chrome_binary)
     try:
+        if not args.self_test:
+            # Optional Google sign-in (throwaway account) so YouTube does
+            # not show its signed-out bot gate. No-op without credentials.
+            sign_in(driver, video_id, args.output_dir)
+
         print(f"Opening: {url}")
         driver.get(url)
 
