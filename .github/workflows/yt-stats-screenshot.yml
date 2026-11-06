@@ -1,0 +1,86 @@
+# YouTube Stats-for-Nerds Screenshot
+#
+# Runs a real, full, real-time watch of a YouTube video on a GitHub-hosted
+# runner (public internet, real Chrome), enables the genuine YouTube
+# "Stats for nerds" overlay, and saves a screenshot of the player.
+#
+# The screenshot is then BOTH:
+#   1. uploaded as a workflow artifact (backup), and
+#   2. committed back into this repo under screenshots/stats-<video-id>.png
+#      using the built-in GITHUB_TOKEN — so it is fetchable with no auth at
+#      https://raw.githubusercontent.com/<owner>/<repo>/<branch>/screenshots/stats-<video-id>.png
+#      No one has to download or send the file by hand.
+#
+# Run it from: repo -> Actions -> "YouTube Stats Screenshot" -> Run workflow.
+
+name: YouTube Stats Screenshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "YouTube video URL (e.g. https://www.youtube.com/watch?v=XXXX)"
+        required: false
+        type: string
+      keyword:
+        description: "OR a YouTube search keyword (the top result is opened)"
+        required: false
+        type: string
+
+# Write access is needed so the workflow can commit the screenshot PNG
+# back into this repo (screenshots/) with the built-in GITHUB_TOKEN.
+permissions:
+  contents: write
+
+# Serialize runs: two simultaneous runs would otherwise race on `git push`.
+concurrency:
+  group: yt-stats-screenshot
+  cancel-in-progress: false
+
+jobs:
+  screenshot:
+    runs-on: ubuntu-latest
+    # Longest supported video is 8:00 + browser startup + upload.
+    timeout-minutes: 20
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Selenium
+        run: pip install selenium
+
+      - name: Take Stats-for-Nerds screenshot
+        id: screenshot
+        run: |
+          if [ -n "${{ inputs.video_url }}" ]; then
+            python yt_stats_screenshot.py --video-url "${{ inputs.video_url }}" --output-dir screenshots
+          elif [ -n "${{ inputs.keyword }}" ]; then
+            python yt_stats_screenshot.py --keyword "${{ inputs.keyword }}" --output-dir screenshots
+          else
+            echo "ERROR: enter a video_url or a keyword." >&2
+            exit 1
+          fi
+
+      - name: Upload screenshot artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: stats-${{ steps.screenshot.outputs.video_id }}
+          path: screenshots/*.png
+          if-no-files-found: error
+
+      - name: Commit screenshot back to the repo
+        run: |
+          git config user.name "yt-stats-bot"
+          git config user.email "yt-stats-bot@users.noreply.github.com"
+          git add screenshots/
+          if git diff --cached --quiet; then
+            echo "No new screenshot to commit."
+          else
+            git commit -m "Add Stats screenshot for ${{ steps.screenshot.outputs.video_id }}"
+            git push
+          fi
