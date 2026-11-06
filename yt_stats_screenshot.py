@@ -57,8 +57,8 @@ STALL_TIMEOUT_S = 30      # currentTime must advance within this window
 PLAY_TIMEOUT_S = 90       # time allowed for the video element to appear
 
 BOT_MARKERS = ["not a robot", "unusual traffic", "verify you are human",
-               "captcha", "confirm you're human",
-               "our systems have detected"]
+               "captcha", "confirm you're human", "confirm you're not a bot",
+               "sign in to confirm", "our systems have detected"]
 
 
 def fail(code, message):
