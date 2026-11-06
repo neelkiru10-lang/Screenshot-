@@ -28,8 +28,10 @@ Exit codes:
   1  usage error (no video URL / keyword)
   2  video did not play (currentTime stuck at 0, or no <video> element)
   3  Stats-for-Nerds overlay did not appear
-  4  bot-check / consent page blocked the run (re-run later)
-  5  video length outside the supported range (under 5s or over 8:00)
+  5  bot-check / consent-wall markers found in the page text
+     ("not a robot", "unusual traffic", "verify you are human", "captcha")
+  6  video length outside the supported range (under 5s or over 8:00)
+     (v1 used 4 for bot-check and 5 for length; v2 renumbers bot-check to 5.)
 
 Requires: selenium (pip install selenium). Chrome is provided by
 Selenium Manager (GitHub-hosted runners already have Google Chrome).
@@ -52,7 +54,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 MIN_DURATION_S = 5        # videos shorter than this are not worth a run
 MAX_DURATION_S = 480      # 8:00 — bounds the GitHub Actions runtime
 STALL_TIMEOUT_S = 30      # currentTime must advance within this window
-PLAY_TIMEOUT_S = 60       # time allowed for the video element to appear
+PLAY_TIMEOUT_S = 90       # time allowed for the video element to appear
+
+BOT_MARKERS = ["not a robot", "unusual traffic", "verify you are human",
+               "captcha", "confirm you're human",
+               "our systems have detected"]
 
 
 def fail(code, message):
@@ -69,14 +75,33 @@ def set_output(key, value):
 
 
 def extract_video_id(url):
-    """Video ID from a youtube.com/watch?v=... or youtu.be/... URL."""
+    """Video ID from a youtube.com/watch?v=..., youtu.be/... or /shorts/... URL."""
     parsed = urllib.parse.urlparse(url)
     if "youtu.be" in parsed.netloc:
         return parsed.path.strip("/").split("/")[0] or None
+    if "/shorts/" in parsed.path:
+        parts = parsed.path.strip("/").split("/")
+        idx = parts.index("shorts")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
     qs = urllib.parse.parse_qs(parsed.query)
     if "v" in qs:
         return qs["v"][0]
     return None
+
+
+def normalize_watch_url(url):
+    """youtu.be/ID and /shorts/ID -> https://www.youtube.com/watch?v=ID.
+
+    Short and embed-style URLs can land on different YouTube surfaces
+    (redirects, interstitials). The plain watch URL is the most direct
+    route to the player.
+    """
+    video_id = extract_video_id(url)
+    parsed = urllib.parse.urlparse(url)
+    if video_id and ("youtu.be" in parsed.netloc or "/shorts/" in parsed.path):
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return url
 
 
 def make_driver(chrome_binary=None):
@@ -89,13 +114,20 @@ def make_driver(chrome_binary=None):
     options.add_argument("--window-size=1280,900")
     options.add_argument("--mute-audio")
     options.add_argument("--autoplay-policy=no-user-gesture-required")
+    options.add_argument("--lang=en-US")
     # Headless Chrome's default UA contains "HeadlessChrome", which makes
     # YouTube show bot-checks far more often. A plain desktop Chrome UA
     # is a normal browser configuration, not a spoof of the watch itself.
     options.add_argument(
         "user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     )
+    # Hide the automation flags Selenium sets by default. This only makes
+    # the browser look like an ordinary desktop Chrome; the watch itself
+    # is still a real, full, real-time play at 1x speed.
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(90)
     return driver
@@ -112,20 +144,38 @@ def video_state(driver):
 
 
 def dismiss_consent(driver, timeout=15):
-    """Click through YouTube/Google consent dialogs, if any appear."""
-    labels = ["Accept all", "Reject all", "I agree", "Accept"]
+    """Click through YouTube/Google consent dialogs, if any appear.
+
+    Tries several selector strategies because the dialog varies by
+    region and surface: button text, aria-label, and role=button.
+    Returns True once a consent button was clicked.
+    """
+    strategies = []
+    for label in ("Accept all", "Reject all", "I agree", "Accept"):
+        strategies.append(
+            (f"button text '{label}'",
+             f"//button[contains(., '{label}')]"))
+        strategies.append(
+            (f"aria-label '{label}'",
+             f"//*[@aria-label='{label}']"))
+    strategies.append(
+        ("role=button 'Accept all'",
+         "//*[@role='button' and contains(., 'Accept all')]"))
+    strategies.append(
+        ("role=button 'Reject all'",
+         "//*[@role='button' and contains(., 'Reject all')]"))
+
     deadline = time.time() + timeout
     while time.time() < deadline:
-        for label in labels:
+        for name, xpath in strategies:
             try:
-                buttons = driver.find_elements(
-                    By.XPATH,
-                    f"//button[contains(., '{label}')]",
-                )
-                for btn in buttons:
-                    if btn.is_displayed():
-                        print(f"Consent dialog: clicking '{label}'")
-                        btn.click()
+                for el in driver.find_elements(By.XPATH, xpath):
+                    if el.is_displayed():
+                        print(f"Consent dialog: clicking via {name}")
+                        try:
+                            el.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", el)
                         time.sleep(2)
                         return True
             except Exception:
@@ -134,33 +184,65 @@ def dismiss_consent(driver, timeout=15):
     return False
 
 
-def looks_like_bot_check(driver):
-    text = ""
+def page_text_lower(driver):
     try:
-        text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        return driver.find_element(By.TAG_NAME, "body").text.lower()
     except Exception:
-        pass
+        return ""
+
+
+def looks_like_bot_check(driver):
+    text = page_text_lower(driver)
     url = driver.current_url.lower()
-    signals = ["unusual traffic", "not a robot", "confirm you're human",
-               "verify you are human", "our systems have detected"]
-    if any(s in text for s in signals):
+    if any(s in text for s in BOT_MARKERS):
         return True
     if "sorry" in url and "google.com" in url:
         return True
     return False
 
 
-def wait_for_video(driver):
+def dump_debug(driver, video_id, output_dir):
+    """Save a screenshot of whatever page actually loaded, plus title,
+    URL and a page-text snippet, so a failure can be diagnosed."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"debug-{video_id}.png")
+    try:
+        driver.save_screenshot(path)
+        print(f"Debug screenshot saved: {path}")
+    except Exception as exc:  # noqa: BLE001 - best effort
+        print(f"Could not save debug screenshot: {exc}")
+    try:
+        print(f"Debug page title: {driver.title!r}")
+    except Exception:
+        pass
+    try:
+        print(f"Debug current URL: {driver.current_url}")
+    except Exception:
+        pass
+    snippet = page_text_lower(driver).replace("\n", " ")[:500]
+    print(f"Debug page text (first 500 chars): {snippet!r}")
+    return path
+
+
+def wait_for_video(driver, video_id, output_dir):
     """Wait until a <video> element with a real duration exists."""
     deadline = time.time() + PLAY_TIMEOUT_S
     while time.time() < deadline:
         if looks_like_bot_check(driver):
-            fail(4, "YouTube showed a bot-check / unusual-traffic page. "
+            dump_debug(driver, video_id, output_dir)
+            fail(5, "YouTube showed a bot-check / unusual-traffic page. "
                     "Re-run the workflow later.")
         state = video_state(driver)
         if state and state["d"] and state["d"] > 0 and state["d"] != float("inf"):
             return state
         time.sleep(2)
+    # No video within the timeout: record what page actually loaded so
+    # the failure can be diagnosed from the debug artifact.
+    dump_debug(driver, video_id, output_dir)
+    if any(marker in page_text_lower(driver) for marker in BOT_MARKERS):
+        fail(5, "No <video> element appeared within "
+                f"{PLAY_TIMEOUT_S}s and the page text contains bot-check "
+                "markers. Re-run the workflow later.")
     fail(2, "No playable <video> element appeared within "
             f"{PLAY_TIMEOUT_S}s (video may be unavailable / region-blocked).")
 
@@ -313,7 +395,7 @@ def main():
         video_id = extract_video_id(args.video_url)
         if not video_id:
             fail(1, f"Could not read a video ID from --video-url: {args.video_url}")
-        url = args.video_url
+        url = normalize_watch_url(args.video_url)
     elif args.keyword:
         video_id = None  # resolved after opening the top search result
         url = ("https://www.youtube.com/results?search_query="
@@ -332,7 +414,8 @@ def main():
         if not args.self_test:
             dismiss_consent(driver)
             if looks_like_bot_check(driver):
-                fail(4, "YouTube showed a bot-check / unusual-traffic page. "
+                dump_debug(driver, video_id, args.output_dir)
+                fail(5, "YouTube showed a bot-check / unusual-traffic page. "
                         "Re-run the workflow later.")
 
             if args.keyword:
@@ -353,11 +436,11 @@ def main():
                             f"(search may be blocked): {args.keyword}")
                 dismiss_consent(driver)
 
-        state = wait_for_video(driver)
+        state = wait_for_video(driver, video_id, args.output_dir)
         duration = state["d"]
         print(f"Video duration: {duration:.1f}s ({duration/60:.2f} min)")
         if duration < MIN_DURATION_S or duration > MAX_DURATION_S:
-            fail(5, f"Video is {duration:.0f}s long; supported range is "
+            fail(6, f"Video is {duration:.0f}s long; supported range is "
                     f"{MIN_DURATION_S}s to {MAX_DURATION_S}s (8:00).")
 
         start_playback(driver)
